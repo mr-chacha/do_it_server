@@ -38,8 +38,8 @@ function generateVerificationCode() {
 // 만료 시간 10분
 const EXPIRATION_TIME = 10 * 60 * 1000;
 
-// 1. POST /api/emails/send-code - 이메일 인증번호 발송
-app.post("/api/verification", async (req, res) => {
+// 1.이메일 인증번호 발송 
+app.post("/api/signup/verifications", async (req, res) => {
   try {
     const { email } = req.body;
 
@@ -60,49 +60,55 @@ app.post("/api/verification", async (req, res) => {
       });
     }
 
+    // 기존 인증번호 확인
+    const existing = verificationCodes.get(email);
+    const isResend = !!existing; // 재발송 여부 확인
+
     // 인증번호 생성
     const code = generateVerificationCode();
     const expiresAt = Date.now() + EXPIRATION_TIME;
 
-    // 인증번호 저장 (이메일을 키로 사용)
+    // 인증번호 저장
     verificationCodes.set(email, {
       code,
       expiresAt,
-      attempts: 0, // 시도 횟수
+      attempts: 0,
       maxAttempts: 5,
     });
 
-    console.log(`📧 인증번호 생성: ${code} (발송 대상: ${email})`);
+    console.log(`📧 인증번호 ${isResend ? '재발송' : '발송'}: ${code} (대상: ${email})`);
 
     // 이메일 발송
     const mailOptions = {
       from: "hoitchac@gmail.com",
       to: email,
-      subject: "이메일 인증번호",
-      text: `안녕하세요!\n\n인증번호는 ${code} 입니다.\n\n유효 시간: 10분\n\n이 메일은 자동 발송된 메일입니다.`,
+      subject: isResend ? "[재발송] 이메일 인증번호" : "이메일 인증번호",
+      text: `안녕하세요!\n\n인증번호${isResend ? '가 재발송되었습니다' : '는'} ${code} 입니다.\n\n유효 시간: 10분`,
       html: `
         <div style="font-family: Arial, sans-serif; padding: 20px;">
-          <h2 style="color: #333;">이메일 인증번호</h2>
+          <h2 style="color: #333;">
+            이메일 인증번호 ${isResend ? '재발송' : ''}
+          </h2>
           <p>안녕하세요!</p>
-          <p>인증번호는 아래와 같습니다:</p>
+          <p>인증번호${isResend ? '가 재발송되었습니다. 새로운 ' : '는 아래와 같습니다'}:</p>
           <div style="background: #f4f4f4; padding: 15px; margin: 20px 0; font-size: 24px; font-weight: bold; text-align: center; letter-spacing: 5px;">
             ${code}
           </div>
           <p style="color: #666; font-size: 14px;">유효 시간: 10분</p>
-          <p style="color: #999; font-size: 12px;">이 메일은 자동 발송된 메일입니다.</p>
         </div>
       `,
     };
 
-    const info = await transporter.sendMail(mailOptions);
+    await transporter.sendMail(mailOptions);
 
     // 성공 응답
-    res.status(200).json({
+    res.status(isResend ? 200 : 201).json({  // 생성은 201, 재발송은 200
       success: true,
-      message: "인증번호가 이메일로 발송되었습니다.",
+      message: `인증번호가 ${isResend ? '재' : ''}발송되었습니다.`,
       data: {
         email,
         expiresIn: "10분",
+        isResend,  // 재발송 여부 포함
       },
     });
   } catch (error) {
@@ -114,6 +120,87 @@ app.post("/api/verification", async (req, res) => {
     });
   }
 });
+
+
+// 2. 이메일로 발송된 인증번호 확인
+app.post("/api/signup/verifications/validation", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    // 입력값 검증
+    if (!email || !code) {
+      return res.status(400).json({
+        success: false,
+        error: "이메일과 인증번호를 모두 입력해주세요.",
+      });
+    }
+
+    // 저장된 인증번호 확인
+    const stored = verificationCodes.get(email);
+
+    if (!stored) {
+      return res.status(404).json({
+        success: false,
+        error: "인증번호가 발송되지 않았거나 만료되었습니다.",
+      });
+    }
+
+    // 만료 시간 확인
+    if (Date.now() > stored.expiresAt) {
+      verificationCodes.delete(email); // 만료된 정보 삭제
+      return res.status(400).json({
+        success: false,
+        error: "인증번호가 만료되었습니다. 다시 발송해주세요.",
+      });
+    }
+
+    // 시도 횟수 확인
+    if (stored.attempts >= stored.maxAttempts) {
+      verificationCodes.delete(email);
+      return res.status(400).json({
+        success: false,
+        error: "인증번호 입력 시도 횟수를 초과했습니다. 다시 발송해주세요.",
+      });
+    }
+
+    // 시도 횟수 증가
+    stored.attempts += 1;
+
+    // 인증번호 검증
+    if (stored.code !== code) {
+      return res.status(400).json({
+        success: false,
+        error: "인증번호가 올바르지 않습니다.",
+        data: {
+          remainingAttempts: stored.maxAttempts - stored.attempts,
+        },
+      });
+    }
+
+    // 인증 성공
+    verificationCodes.delete(email); // 인증 완료 후 삭제
+
+    console.log(`✅ 인증 성공: ${email}`);
+
+    res.json({
+      success: true,
+      message: "이메일 인증이 완료되었습니다.",
+      data: {
+        email,
+        verified: true,
+        verifiedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("인증번호 검증 실패:", error);
+    res.status(500).json({
+      success: false,
+      error: "인증번호 검증 중 오류가 발생했습니다.",
+      details: error.message,
+    });
+  }
+});
+
 
 app.get("/", (req, res) => {
   res.send("🚀 Express server is running!");
