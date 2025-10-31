@@ -1,5 +1,12 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
+
+# Firebase 서비스 계정 키
+firebase/serviceAccountKey.json
+*.json
+!package*.json
+!package-lock.json
+
 # dependencies
 /node_modules
 /.pnp
