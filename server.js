@@ -7,6 +7,8 @@ const { db, admin } = require("./firebase/firebase");
 const app = express();
 const PORT = 4000;
 
+require("dotenv").config();
+
 // JWT 시크릿 키 (환경변수로 관리 권장)
 const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
@@ -472,7 +474,7 @@ app.post("/api/connect", authenticateToken, async (req, res) => {
     const acceptUrl = `http://localhost:3000/connect/accept?token=${invitationToken}`;
 
     const mailOptions = {
-      from: "hoitchac@gmail.com",
+      from: process.env.GMAIL_USER,
       to: normalizedPartnerEmail,
       subject: "💕 커플 연결 초대장",
       html: `
@@ -834,7 +836,7 @@ app.post("/api/connect/resend", authenticateToken, async (req, res) => {
     const senderData = senderDoc.data();
 
     const mailOptions = {
-      from: "hoitchac@gmail.com",
+      from: process.env.GMAIL_USER,
       to: invitationData.receiverEmail,
       subject: "💕 커플 연결 초대장 (재발송)",
       html: `
@@ -893,8 +895,8 @@ app.post("/api/connect/cancel", async (req, res) => {});
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
-    user: "hoitchac@gmail.com",
-    pass: "yizvzyyrxjjcheox",
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_PASS,
   },
 });
 
@@ -984,7 +986,7 @@ app.post("/api/verifications", async (req, res) => {
 
     // 이메일 발송
     const mailOptions = {
-      from: "hoitchac@gmail.com",
+      from: process.env.GMAIL_USER,
       to: normalizedEmail,
       subject: isResend ? "[재발송] 이메일 인증번호" : "이메일 인증번호",
       text: `안녕하세요!\n\n인증번호${
@@ -1146,6 +1148,177 @@ app.post("/api/verifications/validation", async (req, res) => {
         code: error.code || "UNKNOWN_ERROR",
         details:
           process.env.NODE_ENV === "development" ? error.message : undefined,
+      },
+    });
+  }
+});
+
+// 가계부 거래 등록 API (인증 필요)
+app.post("/api/finance/transactions", authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { type, title, amount, category, description, date } = req.body;
+
+    // 입력값 검증
+    if (!type || !title || !amount || !category) {
+      return res.status(400).json({
+        status: 400,
+        error: "필수 필드를 입력해주세요.",
+        data: {
+          missingFields: [
+            !type && "type",
+            !title && "title",
+            !amount && "amount",
+            !category && "category",
+          ].filter(Boolean),
+        },
+      });
+    }
+
+    // 연결 상태 확인
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        status: 404,
+        error: "사용자를 찾을 수 없습니다.",
+      });
+    }
+
+    const userData = userDoc.data();
+    if (!userData.coupleId) {
+      return res.status(400).json({
+        status: 400,
+        error: "커플 연결이 필요합니다.",
+      });
+    }
+
+    // 거래 데이터 생성
+    const transactionData = {
+      type: type, // income, expense, savings
+      title: title,
+      amount: parseInt(amount),
+      category: category,
+      description: description || "",
+      date: date
+        ? admin.firestore.Timestamp.fromDate(new Date(date))
+        : admin.firestore.FieldValue.serverTimestamp(),
+      createdBy: userId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // Firestore에 저장
+    const transactionsRef = db
+      .collection("couples")
+      .doc(userData.coupleId)
+      .collection("transactions");
+    const transactionDoc = await transactionsRef.add(transactionData);
+
+    console.log(`✅ 거래 등록 성공: ${userId}`);
+
+    res.status(201).json({
+      status: 201,
+      message: "거래가 등록되었습니다.",
+      data: {
+        transaction: {
+          id: transactionDoc.id,
+          ...transactionData,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("거래 등록 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "거래 등록 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+      },
+    });
+  }
+});
+
+// 가계부 거래 조회 API (인증 필요)
+app.get("/api/finance/transactions", authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { year, month, type } = req.query;
+
+    // 연결 상태 확인
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        status: 404,
+        error: "사용자를 찾을 수 없습니다.",
+      });
+    }
+
+    const userData = userDoc.data();
+    if (!userData.coupleId) {
+      return res.status(400).json({
+        status: 400,
+        error: "커플 연결이 필요합니다.",
+      });
+    }
+
+    // 쿼리 구성
+    let query = db
+      .collection("couples")
+      .doc(userData.coupleId)
+      .collection("transactions");
+
+    // 날짜 필터링
+    if (year && month) {
+      const startDate = new Date(parseInt(year), parseInt(month) - 1, 1);
+      const endDate = new Date(parseInt(year), parseInt(month), 0, 23, 59, 59);
+
+      query = query
+        .where("date", ">=", admin.firestore.Timestamp.fromDate(startDate))
+        .where("date", "<=", admin.firestore.Timestamp.fromDate(endDate));
+    }
+
+    // 타입 필터링
+    if (type) {
+      query = query.where("type", "==", type);
+    }
+
+    // 최신순 정렬 및 조회
+    const snapshot = await query.orderBy("date", "desc").get();
+
+    const transactions = [];
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      transactions.push({
+        id: doc.id,
+        type: data.type,
+        title: data.title,
+        amount: data.amount,
+        category: data.category,
+        description: data.description,
+        date: data.date.toDate().toISOString(),
+        createdBy: data.createdBy,
+        createdAt: data.createdAt?.toDate()?.toISOString(),
+        updatedAt: data.updatedAt?.toDate()?.toISOString(),
+      });
+    });
+
+    res.status(200).json({
+      status: 200,
+      message: "거래 내역 조회 성공",
+      data: {
+        transactions,
+        count: transactions.length,
+      },
+    });
+  } catch (error) {
+    console.error("거래 조회 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "거래 조회 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
       },
     });
   }
