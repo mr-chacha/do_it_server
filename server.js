@@ -1534,6 +1534,519 @@ app.delete(
   }
 );
 
+// 일정 등록 API (인증 필요)
+app.post("/api/calendar/events", authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const {
+      title,
+      description,
+      startDate,
+      endDate,
+      author,
+      repeatType,
+      repeatEndDate,
+    } = req.body;
+
+    // 입력값 검증
+    if (!title || !startDate || !endDate) {
+      return res.status(400).json({
+        status: 400,
+        error: "필수 필드를 입력해주세요.",
+        data: {
+          missingFields: [
+            !title && "title",
+            !startDate && "startDate",
+            !endDate && "endDate",
+          ].filter(Boolean),
+        },
+      });
+    }
+
+    // 연결 상태 확인
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        status: 404,
+        error: "사용자를 찾을 수 없습니다.",
+      });
+    }
+
+    const userData = userDoc.data();
+    if (!userData.coupleId) {
+      return res.status(400).json({
+        status: 400,
+        error: "커플 연결이 필요합니다.",
+      });
+    }
+
+    // 일정 등록 API에서도 상대방 찾기 수정
+    let authorId = null;
+    if (author === "me") {
+      authorId = userId; // 로그인한 사용자의 userId
+    } else if (author === "partner") {
+      // ⭐ 상대방의 userId 찾기 (인덱스 없이 작동)
+      const allUsersSnapshot = await db
+        .collection("users")
+        .where("coupleId", "==", userData.coupleId)
+        .get();
+
+      // 현재 사용자가 아닌 사용자 찾기
+      let foundPartnerId = null;
+      allUsersSnapshot.forEach((doc) => {
+        if (doc.id !== userId) {
+          foundPartnerId = doc.id;
+        }
+      });
+
+      if (!foundPartnerId) {
+        return res.status(400).json({
+          status: 400,
+          error: "상대방 정보를 찾을 수 없습니다.",
+        });
+      }
+      authorId = foundPartnerId;
+    } else if (author === "us") {
+      authorId = userData.coupleId; // coupleId 사용
+    } else {
+      return res.status(400).json({
+        status: 400,
+        error: "유효하지 않은 작성자입니다.",
+      });
+    }
+
+    // 일정 데이터 생성
+    const eventData = {
+      title: title.trim(),
+      description: description || "",
+      startDate: admin.firestore.Timestamp.fromDate(new Date(startDate)),
+      endDate: admin.firestore.Timestamp.fromDate(new Date(endDate)),
+      author: authorId, // ⭐ userId 또는 coupleId로 저장
+      authorType: author, // ⭐ 원본 타입 저장 (me, partner, us)
+      repeatType: repeatType || "none",
+      repeatEndDate: repeatEndDate
+        ? admin.firestore.Timestamp.fromDate(new Date(repeatEndDate))
+        : null,
+      createdBy: userId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // Firestore에 저장
+    const eventsRef = db
+      .collection("couples")
+      .doc(userData.coupleId)
+      .collection("events");
+    const eventDoc = await eventsRef.add(eventData);
+
+    console.log(`✅ 일정 등록 성공: ${userId} - ${eventDoc.id}`);
+
+    res.status(201).json({
+      status: 201,
+      message: "일정이 등록되었습니다.",
+      data: {
+        event: {
+          id: eventDoc.id,
+          ...eventData,
+          startDate: eventData.startDate.toDate().toISOString(),
+          endDate: eventData.endDate.toDate().toISOString(),
+          repeatEndDate:
+            eventData.repeatEndDate?.toDate()?.toISOString() || null,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("일정 등록 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "일정 등록 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+        details:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      },
+    });
+  }
+});
+
+// 일정 조회 API (인증 필요)
+app.get("/api/calendar/events", authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { year, month, startDate, endDate } = req.query;
+
+    // 연결 상태 확인
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        status: 404,
+        error: "사용자를 찾을 수 없습니다.",
+      });
+    }
+
+    const userData = userDoc.data();
+    if (!userData.coupleId) {
+      return res.status(400).json({
+        status: 400,
+        error: "커플 연결이 필요합니다.",
+      });
+    }
+
+    // ⭐ 상대방 userId 가져오기 (인덱스 없이 작동하도록 수정)
+    const allUsersSnapshot = await db
+      .collection("users")
+      .where("coupleId", "==", userData.coupleId)
+      .get();
+
+    // 현재 사용자가 아닌 사용자 찾기
+    let partnerUserId = null;
+    allUsersSnapshot.forEach((doc) => {
+      if (doc.id !== userId) {
+        partnerUserId = doc.id;
+      }
+    });
+
+    // 쿼리 구성
+    let query = db
+      .collection("couples")
+      .doc(userData.coupleId)
+      .collection("events");
+
+    // ⭐ 날짜 필터링 코드 복원
+    if (year && month) {
+      // 년월로 필터링
+      const startDateFilter = new Date(parseInt(year), parseInt(month) - 1, 1);
+      const endDateFilter = new Date(
+        parseInt(year),
+        parseInt(month),
+        0,
+        23,
+        59,
+        59
+      );
+
+      query = query
+        .where(
+          "startDate",
+          ">=",
+          admin.firestore.Timestamp.fromDate(startDateFilter)
+        )
+        .where(
+          "startDate",
+          "<=",
+          admin.firestore.Timestamp.fromDate(endDateFilter)
+        );
+    } else if (startDate && endDate) {
+      // 시작일/종료일로 필터링
+      query = query
+        .where(
+          "startDate",
+          ">=",
+          admin.firestore.Timestamp.fromDate(new Date(startDate))
+        )
+        .where(
+          "startDate",
+          "<=",
+          admin.firestore.Timestamp.fromDate(new Date(endDate))
+        );
+    }
+
+    // 최신순 정렬 및 조회
+    const snapshot = await query.orderBy("startDate", "asc").get();
+
+    const events = [];
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+
+      // ⭐ author를 현재 사용자 기준으로 변환
+      // createdBy를 기준으로 판단하는 것이 더 정확함
+      let displayAuthor = "me"; // 기본값
+
+      // author가 coupleId인 경우 (우리)
+      if (String(data.author) === String(userData.coupleId)) {
+        displayAuthor = "us";
+      }
+      // createdBy가 현재 사용자인 경우 (나)
+      else if (String(data.createdBy) === String(userId)) {
+        displayAuthor = "me";
+      }
+      // createdBy가 상대방인 경우 (상대방)
+      else if (
+        partnerUserId &&
+        String(data.createdBy) === String(partnerUserId)
+      ) {
+        displayAuthor = "partner";
+      }
+      // author가 상대방 userId인 경우도 체크 (이전 데이터 호환성)
+      else if (partnerUserId && String(data.author) === String(partnerUserId)) {
+        displayAuthor = "partner";
+      }
+
+      events.push({
+        id: doc.id,
+        title: data.title,
+        description: data.description,
+        startDate: data.startDate.toDate().toISOString(),
+        endDate: data.endDate.toDate().toISOString(),
+        author: displayAuthor, // ⭐ 변환된 author
+        repeatType: data.repeatType,
+        repeatEndDate: data.repeatEndDate?.toDate()?.toISOString() || null,
+        createdBy: data.createdBy,
+        createdAt: data.createdAt?.toDate()?.toISOString(),
+        updatedAt: data.updatedAt?.toDate()?.toISOString(),
+      });
+    });
+
+    res.status(200).json({
+      status: 200,
+      message: "일정 조회 성공",
+      data: {
+        events,
+        count: events.length,
+      },
+    });
+  } catch (error) {
+    console.error("일정 조회 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "일정 조회 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+        details:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      },
+    });
+  }
+});
+
+// 일정 수정 API (인증 필요)
+app.put(
+  "/api/calendar/events/:eventId",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { userId } = req.user;
+      const { eventId } = req.params;
+      const {
+        title,
+        description,
+        startDate,
+        endDate,
+        author,
+        repeatType,
+        repeatEndDate,
+      } = req.body;
+
+      // 입력값 검증
+      if (!title || !startDate || !endDate) {
+        return res.status(400).json({
+          status: 400,
+          error: "필수 필드를 입력해주세요.",
+          data: {
+            missingFields: [
+              !title && "title",
+              !startDate && "startDate",
+              !endDate && "endDate",
+            ].filter(Boolean),
+          },
+        });
+      }
+
+      // 연결 상태 확인
+      const userDoc = await db.collection("users").doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(404).json({
+          status: 404,
+          error: "사용자를 찾을 수 없습니다.",
+        });
+      }
+
+      const userData = userDoc.data();
+      if (!userData.coupleId) {
+        return res.status(400).json({
+          status: 400,
+          error: "커플 연결이 필요합니다.",
+        });
+      }
+
+      // 일정 존재 및 권한 확인
+      const eventRef = db
+        .collection("couples")
+        .doc(userData.coupleId)
+        .collection("events")
+        .doc(eventId);
+
+      const eventDoc = await eventRef.get();
+
+      if (!eventDoc.exists) {
+        return res.status(404).json({
+          status: 404,
+          error: "일정을 찾을 수 없습니다.",
+          data: {
+            eventId,
+          },
+        });
+      }
+
+      const eventData = eventDoc.data();
+
+      // 본인이 작성한 일정만 수정 가능
+      if (eventData.createdBy !== userId) {
+        return res.status(403).json({
+          status: 403,
+          error: "본인이 작성한 일정만 수정할 수 있습니다.",
+          data: {
+            eventId,
+            createdBy: eventData.createdBy,
+          },
+        });
+      }
+
+      // 수정 데이터 구성
+      const updateData = {
+        title: title.trim(),
+        description: description || "",
+        startDate: admin.firestore.Timestamp.fromDate(new Date(startDate)),
+        endDate: admin.firestore.Timestamp.fromDate(new Date(endDate)),
+        author: author || eventData.author,
+        repeatType: repeatType || eventData.repeatType || "none",
+        repeatEndDate: repeatEndDate
+          ? admin.firestore.Timestamp.fromDate(new Date(repeatEndDate))
+          : eventData.repeatEndDate,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      // Firestore에 업데이트
+      await eventRef.update(updateData);
+
+      console.log(`✅ 일정 수정 성공: ${userId} - ${eventId}`);
+
+      res.status(200).json({
+        status: 200,
+        message: "일정이 수정되었습니다.",
+        data: {
+          event: {
+            id: eventId,
+            ...updateData,
+            startDate: updateData.startDate.toDate().toISOString(),
+            endDate: updateData.endDate.toDate().toISOString(),
+            repeatEndDate:
+              updateData.repeatEndDate?.toDate()?.toISOString() || null,
+            createdBy: eventData.createdBy,
+            createdAt: eventData.createdAt?.toDate()?.toISOString(),
+          },
+        },
+      });
+    } catch (error) {
+      console.error("일정 수정 실패:", error);
+      res.status(500).json({
+        status: 500,
+        error: "일정 수정 중 오류가 발생했습니다.",
+        data: {
+          timestamp: new Date().toISOString(),
+          code: error.code || "UNKNOWN_ERROR",
+          details:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        },
+      });
+    }
+  }
+);
+
+// 일정 삭제 API (인증 필요)
+app.delete(
+  "/api/calendar/events/:eventId",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { userId } = req.user;
+      const { eventId } = req.params;
+
+      // 연결 상태 확인
+      const userDoc = await db.collection("users").doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(404).json({
+          status: 404,
+          error: "사용자를 찾을 수 없습니다.",
+        });
+      }
+
+      const userData = userDoc.data();
+      if (!userData.coupleId) {
+        return res.status(400).json({
+          status: 400,
+          error: "커플 연결이 필요합니다.",
+        });
+      }
+
+      // 일정 존재 및 권한 확인
+      const eventRef = db
+        .collection("couples")
+        .doc(userData.coupleId)
+        .collection("events")
+        .doc(eventId);
+
+      const eventDoc = await eventRef.get();
+
+      if (!eventDoc.exists) {
+        return res.status(404).json({
+          status: 404,
+          error: "일정을 찾을 수 없습니다.",
+          data: {
+            eventId,
+          },
+        });
+      }
+
+      const eventData = eventDoc.data();
+
+      // ⭐ "우리" 일정이면 둘 다 삭제 가능, 그 외에는 본인만 삭제 가능
+      const isUsEvent = eventData.author === userData.coupleId;
+      const isCreatedByMe = eventData.createdBy === userId;
+
+      if (!isUsEvent && !isCreatedByMe) {
+        // "우리"가 아니고 본인이 작성하지 않은 경우 삭제 불가
+        return res.status(403).json({
+          status: 403,
+          error: "본인이 작성한 일정만 삭제할 수 있습니다.",
+          data: {
+            eventId,
+            createdBy: eventData.createdBy,
+          },
+        });
+      }
+
+      // Firestore에서 삭제
+      await eventRef.delete();
+
+      console.log(`✅ 일정 삭제 성공: ${userId} - ${eventId}`);
+
+      res.status(200).json({
+        status: 200,
+        message: "일정이 삭제되었습니다.",
+        data: {
+          eventId,
+          deletedAt: new Date().toISOString(),
+        },
+      });
+    } catch (error) {
+      console.error("일정 삭제 실패:", error);
+      res.status(500).json({
+        status: 500,
+        error: "일정 삭제 중 오류가 발생했습니다.",
+        data: {
+          timestamp: new Date().toISOString(),
+          code: error.code || "UNKNOWN_ERROR",
+          details:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        },
+      });
+    }
+  }
+);
+
 app.get("/", (req, res) => {
   res.send("🚀 Express server is running!");
 });
