@@ -2,7 +2,7 @@ const express = require("express");
 const nodemailer = require("nodemailer");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
-const { db, admin } = require("./firebase/firebase");
+const { db, admin, bucket } = require("./firebase/firebase");
 
 const app = express();
 const PORT = 4000;
@@ -22,8 +22,10 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-// JSON 파싱을 위한 미들웨어
-app.use(express.json());
+
+// JSON 파싱을 위한 미들웨어 (이미지 업로드를 위해 크기 제한 증가)
+app.use(express.json({ limit: "10mb" })); // 기본 100kb에서 10MB로 증가
+app.use(express.urlencoded({ extended: true, limit: "10mb" })); // URL 인코딩도 증가
 
 // JWT 미들웨어 (인증 확인)
 const authenticateToken = (req, res, next) => {
@@ -284,49 +286,6 @@ app.post("/api/login", async (req, res) => {
         code: error.code || "UNKNOWN_ERROR",
         details:
           process.env.NODE_ENV === "development" ? error.message : undefined,
-      },
-    });
-  }
-});
-
-// 현재 사용자 정보 조회 API (인증 필요)
-app.get("/api/auth/me", authenticateToken, async (req, res) => {
-  try {
-    // req.user는 authenticateToken 미들웨어에서 설정됨
-    const { userId } = req.user;
-
-    // Firestore에서 최신 사용자 정보 조회
-    const userDoc = await db.collection("users").doc(userId).get();
-
-    if (!userDoc.exists) {
-      return res.status(404).json({
-        status: 400,
-        error: "사용자를 찾을 수 없습니다.",
-        data: {
-          userId,
-          notFound: true,
-        },
-      });
-    }
-
-    const userData = userDoc.data();
-    const { password, ...userWithoutPassword } = userData; // 비밀번호 제외
-
-    res.status(200).json({
-      status: 200,
-      message: "사용자 정보 조회 성공",
-      data: {
-        user: userWithoutPassword,
-      },
-    });
-  } catch (error) {
-    console.error("사용자 정보 조회 실패:", error);
-    res.status(500).json({
-      status: 500,
-      error: "사용자 정보 조회 중 오류가 발생했습니다.",
-      data: {
-        timestamp: new Date().toISOString(),
-        code: error.code || "UNKNOWN_ERROR",
       },
     });
   }
@@ -740,6 +699,8 @@ app.post("/api/connect/accept", async (req, res) => {
     batch.update(usersRef.doc(invitationData.senderUserId), {
       coupleId,
       partnerEmail: invitationData.receiverEmail,
+      partnerName: receiverData.name || null, // 파트너 이름 추가
+      partnerNickname: receiverData.nickname || null, // 파트너 닉네임 추가
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -747,6 +708,8 @@ app.post("/api/connect/accept", async (req, res) => {
     batch.update(usersRef.doc(invitationData.receiverUserId), {
       coupleId,
       partnerEmail: invitationData.senderEmail,
+      partnerName: senderData.name || null, // 파트너 이름 추가
+      partnerNickname: senderData.nickname || null, // 파트너 닉네임 추가
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -771,6 +734,7 @@ app.post("/api/connect/accept", async (req, res) => {
       data: {
         partnerEmail: invitationData.senderEmail,
         partnerName: senderData.name || invitationData.senderEmail,
+        partnerNickname: senderData.nickname || null,
       },
     });
   } catch (error) {
@@ -1535,7 +1499,7 @@ app.delete(
 );
 
 // 일정 등록 API (인증 필요)
-app.post("/api/calendar/events", authenticateToken, async (req, res) => {
+app.post("/api/schedule/events", authenticateToken, async (req, res) => {
   try {
     const { userId } = req.user;
     const {
@@ -1671,7 +1635,7 @@ app.post("/api/calendar/events", authenticateToken, async (req, res) => {
 });
 
 // 일정 조회 API (인증 필요)
-app.get("/api/calendar/events", authenticateToken, async (req, res) => {
+app.get("/api/schedule/events", authenticateToken, async (req, res) => {
   try {
     const { userId } = req.user;
     const { year, month, startDate, endDate } = req.query;
@@ -1823,7 +1787,7 @@ app.get("/api/calendar/events", authenticateToken, async (req, res) => {
 
 // 일정 수정 API (인증 필요)
 app.put(
-  "/api/calendar/events/:eventId",
+  "/api/schedule/events/:eventId",
   authenticateToken,
   async (req, res) => {
     try {
@@ -1957,7 +1921,7 @@ app.put(
 
 // 일정 삭제 API (인증 필요)
 app.delete(
-  "/api/calendar/events/:eventId",
+  "/api/schedule/events/:eventId",
   authenticateToken,
   async (req, res) => {
     try {
@@ -2046,6 +2010,232 @@ app.delete(
     }
   }
 );
+
+// 현재 사용자 정보 조회 API (인증 필요)
+app.get("/api/auth/me", authenticateToken, async (req, res) => {
+  try {
+    // req.user는 authenticateToken 미들웨어에서 설정됨
+    const { userId } = req.user;
+
+    // Firestore에서 최신 사용자 정보 조회
+    const userDoc = await db.collection("users").doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        status: 400,
+        error: "사용자를 찾을 수 없습니다.",
+        data: {
+          userId,
+          notFound: true,
+        },
+      });
+    }
+
+    const userData = userDoc.data();
+    const { password, ...userWithoutPassword } = userData; // 비밀번호 제외
+
+    // 파트너 정보 조회
+    let partnerInfo = null;
+    if (userData.coupleId) {
+      // 같은 coupleId를 가진 다른 사용자 찾기
+      const allUsersSnapshot = await db
+        .collection("users")
+        .where("coupleId", "==", userData.coupleId)
+        .get();
+
+      allUsersSnapshot.forEach((doc) => {
+        if (doc.id !== userId) {
+          const partnerData = doc.data();
+          partnerInfo = {
+            userId: doc.id,
+            name: partnerData.name,
+            email: partnerData.email,
+            nickname: partnerData.nickname || null,
+          };
+        }
+      });
+    }
+
+    res.status(200).json({
+      status: 200,
+      message: "사용자 정보 조회 성공",
+      data: {
+        user: userWithoutPassword,
+        partner: partnerInfo, // 파트너 정보 추가
+      },
+    });
+  } catch (error) {
+    console.error("사용자 정보 조회 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "사용자 정보 조회 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+      },
+    });
+  }
+});
+
+// 개인정보 수정 API (인증 필요)
+app.put("/api/auth/me", authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { nickname, profileImage } = req.body;
+
+    // 사용자 존재 확인
+    const userDoc = await db.collection("users").doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        status: 404,
+        error: "사용자를 찾을 수 없습니다.",
+        data: {
+          userId,
+          notFound: true,
+        },
+      });
+    }
+
+    // 업데이트할 데이터 구성
+    const updateData = {
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // 닉네임이 제공된 경우 업데이트
+    if (nickname !== undefined) {
+      updateData.nickname = nickname.trim() || null;
+    }
+
+    // 프로필 이미지가 제공된 경우 Firebase Storage에 업로드
+    if (profileImage !== undefined) {
+      if (profileImage) {
+        // Base64 문자열인지 확인
+        if (profileImage.startsWith("data:image")) {
+          try {
+            // Base64 데이터 파싱
+            const matches = profileImage.match(
+              /^data:image\/(\w+);base64,(.+)$/
+            );
+            if (!matches) {
+              return res.status(400).json({
+                status: 400,
+                error: "올바른 이미지 형식이 아닙니다.",
+              });
+            }
+
+            const imageType = matches[1]; // jpeg, png, gif 등
+            const base64Data = matches[2];
+
+            // 이미지 버퍼 생성
+            const imageBuffer = Buffer.from(base64Data, "base64");
+
+            // 파일명 생성 (userId_timestamp.확장자)
+            const fileName = `profiles/${userId}_${Date.now()}.${imageType}`;
+
+            // Firebase Storage에 업로드
+            const file = bucket.file(fileName);
+            await file.save(imageBuffer, {
+              metadata: {
+                contentType: `image/${imageType}`,
+                metadata: {
+                  uploadedBy: userId,
+                  uploadedAt: new Date().toISOString(),
+                },
+              },
+            });
+
+            // 공개 URL 생성 (읽기 권한 설정 필요)
+            // 또는 signed URL 생성
+            await file.makePublic(); // 공개 접근 허용 (또는 signed URL 사용)
+
+            const imageUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+            updateData.profileImage = imageUrl;
+
+            // 기존 이미지가 있으면 삭제 (선택사항)
+            const userData = userDoc.data();
+            if (
+              userData.profileImage &&
+              userData.profileImage.includes("storage.googleapis.com")
+            ) {
+              try {
+                const oldFileName = userData.profileImage.split(
+                  `${bucket.name}/`
+                )[1];
+                if (oldFileName) {
+                  const oldFile = bucket.file(oldFileName);
+                  await oldFile.delete();
+                }
+              } catch (deleteError) {
+                console.error("기존 이미지 삭제 실패:", deleteError);
+                // 삭제 실패해도 계속 진행
+              }
+            }
+          } catch (uploadError) {
+            console.error("이미지 업로드 실패:", uploadError);
+            return res.status(500).json({
+              status: 500,
+              error: "이미지 업로드 중 오류가 발생했습니다.",
+            });
+          }
+        } else {
+          // 이미 URL인 경우 (기존 이미지 유지)
+          updateData.profileImage = profileImage;
+        }
+      } else {
+        // null인 경우 이미지 삭제
+        const userData = userDoc.data();
+        if (
+          userData.profileImage &&
+          userData.profileImage.includes("storage.googleapis.com")
+        ) {
+          try {
+            const oldFileName = userData.profileImage.split(
+              `${bucket.name}/`
+            )[1];
+            if (oldFileName) {
+              const oldFile = bucket.file(oldFileName);
+              await oldFile.delete();
+            }
+          } catch (deleteError) {
+            console.error("이미지 삭제 실패:", deleteError);
+          }
+        }
+        updateData.profileImage = null;
+      }
+    }
+
+    // Firestore 업데이트
+    await db.collection("users").doc(userId).update(updateData);
+
+    // 업데이트된 사용자 정보 조회
+    const updatedUserDoc = await db.collection("users").doc(userId).get();
+    const updatedUserData = updatedUserDoc.data();
+    const { password, ...userWithoutPassword } = updatedUserData;
+
+    console.log(`✅ 개인정보 수정 성공: ${userId}`);
+
+    res.status(200).json({
+      status: 200,
+      message: "개인정보가 수정되었습니다.",
+      data: {
+        user: userWithoutPassword,
+      },
+    });
+  } catch (error) {
+    console.error("개인정보 수정 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "개인정보 수정 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+        details:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      },
+    });
+  }
+});
 
 app.get("/", (req, res) => {
   res.send("🚀 Express server is running!");
