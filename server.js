@@ -1166,6 +1166,7 @@ app.post("/api/finance/transactions", authenticateToken, async (req, res) => {
         ? admin.firestore.Timestamp.fromDate(new Date(date))
         : admin.firestore.FieldValue.serverTimestamp(),
       createdBy: userId,
+      createdByName: userData.nickname || userData.name || "알 수 없음", // 닉네임 또는 이름 저장
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -1249,9 +1250,43 @@ app.get("/api/finance/transactions", authenticateToken, async (req, res) => {
     // 최신순 정렬 및 조회
     const snapshot = await query.orderBy("date", "desc").get();
 
+    // 모든 사용자 정보를 한 번에 조회 (성능 최적화)
+    const userIds = new Set();
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      if (data.createdBy) {
+        userIds.add(data.createdBy);
+      }
+    });
+
+    // 사용자 정보 일괄 조회
+    const usersMap = {};
+    if (userIds.size > 0) {
+      const usersPromises = Array.from(userIds).map(async (uid) => {
+        const userDoc = await db.collection("users").doc(uid).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          return {
+            id: uid,
+            name: userData.name,
+            nickname: userData.nickname || userData.name || "알 수 없음",
+          };
+        }
+        return null;
+      });
+      const users = await Promise.all(usersPromises);
+      users.forEach((user) => {
+        if (user) {
+          usersMap[user.id] = user;
+        }
+      });
+    }
+
     const transactions = [];
     snapshot.forEach((doc) => {
       const data = doc.data();
+      const creatorInfo = usersMap[data.createdBy] || null;
+
       transactions.push({
         id: doc.id,
         type: data.type,
@@ -1261,6 +1296,11 @@ app.get("/api/finance/transactions", authenticateToken, async (req, res) => {
         description: data.description,
         date: data.date.toDate().toISOString(),
         createdBy: data.createdBy,
+        createdByName:
+          data.createdByName ||
+          creatorInfo?.nickname ||
+          creatorInfo?.name ||
+          "알 수 없음", // 닉네임 포함
         createdAt: data.createdAt?.toDate()?.toISOString(),
         updatedAt: data.updatedAt?.toDate()?.toISOString(),
       });
