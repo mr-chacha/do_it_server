@@ -143,45 +143,11 @@ router.post("/connect", authenticateToken, async (req, res) => {
     });
 
     // ============================================
-    // 4. 초대장 이메일 발송
-    // ============================================
-    const acceptUrl = `http://localhost:3000/connect/accept?token=${invitationToken}`;
-
-    const mailOptions = {
-      from: process.env.GMAIL_USER,
-      to: normalizedPartnerEmail,
-      subject: "💕 커플 연결 초대장",
-      html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #2563eb;">커플 연결 초대장</h2>
-            <p>안녕하세요! <strong>${
-              senderData.name || normalizedSenderEmail
-            }</strong>님께서 커플 연결을 요청하셨습니다.</p>
-            <p>아래 버튼을 클릭하여 연결을 수락해주세요.</p>
-            <div style="text-align: center; margin: 30px 0;">
-              <a href="${acceptUrl}" 
-                 style="display: inline-block; background-color: #2563eb; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">
-                연결 수락하기
-              </a>
-            </div>
-            <p style="color: #666; font-size: 12px;">이 링크는 7일간 유효합니다.</p>
-            <p style="color: #666; font-size: 12px;">만약 본인이 요청하지 않으셨다면 이 이메일을 무시하셔도 됩니다.</p>
-          </div>
-        `,
-    };
-
-    await transporter.sendMail(mailOptions);
-
-    console.log(
-      `✅ 초대장 발송: ${normalizedSenderEmail} -> ${normalizedPartnerEmail}`
-    );
-
-    // ============================================
-    // 5. 성공 응답 (200)
+    // 4. 성공 응답 (200)
     // ============================================
     res.status(200).json({
       status: 200,
-      message: "초대장이 발송되었습니다.",
+      message: "커플 연결 요청이 전송되었습니다.",
       data: {
         partnerEmail: normalizedPartnerEmail,
         sentAt: new Date().toISOString(),
@@ -323,6 +289,231 @@ router.post("/disconnect", authenticateToken, async (req, res) => {
   }
 });
 
+// 보낸 초대장 목록 조회 API
+router.get("/sent-invitations", authenticateToken, async (req, res) => {
+  try {
+    const { userId, email } = req.user;
+
+    const invitationsRef = db.collection("invitations");
+    // orderBy 제거
+    const invitationsSnapshot = await invitationsRef
+      .where("senderUserId", "==", userId)
+      .where("status", "==", "pending")
+      .get(); // ⭐ orderBy 제거
+
+    const invitations = [];
+    const usersRef = db.collection("users");
+
+    for (const doc of invitationsSnapshot.docs) {
+      const invitationData = doc.data();
+
+      if (
+        invitationData.expiresAt &&
+        invitationData.expiresAt.toDate() < new Date()
+      ) {
+        await doc.ref.update({
+          status: "expired",
+        });
+        continue;
+      }
+
+      const receiverDoc = await usersRef
+        .doc(invitationData.receiverUserId)
+        .get();
+      const receiverData = receiverDoc.exists ? receiverDoc.data() : null;
+
+      invitations.push({
+        id: doc.id,
+        token: doc.id,
+        receiverName: receiverData?.name || invitationData.receiverEmail,
+        receiverEmail: invitationData.receiverEmail,
+        createdAt: invitationData.createdAt?.toDate()?.toISOString(),
+        expiresAt: invitationData.expiresAt?.toDate()?.toISOString(),
+      });
+    }
+
+    // ⭐ 클라이언트에서 정렬 (최신순)
+    invitations.sort((a, b) => {
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+
+    res.status(200).json({
+      status: 200,
+      message: "보낸 초대장 목록 조회 성공",
+      data: {
+        invitations,
+        count: invitations.length,
+      },
+    });
+  } catch (error) {
+    console.error("보낸 초대장 목록 조회 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "보낸 초대장 목록 조회 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+        details:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      },
+    });
+  }
+});
+
+// 받은 초대장 목록 조회 API
+router.get("/invitations", authenticateToken, async (req, res) => {
+  try {
+    const { userId, email } = req.user;
+
+    const invitationsRef = db.collection("invitations");
+    // orderBy 제거
+    const invitationsSnapshot = await invitationsRef
+      .where("receiverEmail", "==", email.toLowerCase().trim())
+      .where("status", "==", "pending")
+      .get(); // ⭐ orderBy 제거
+
+    const invitations = [];
+    const usersRef = db.collection("users");
+
+    for (const doc of invitationsSnapshot.docs) {
+      const invitationData = doc.data();
+
+      if (
+        invitationData.expiresAt &&
+        invitationData.expiresAt.toDate() < new Date()
+      ) {
+        await doc.ref.update({
+          status: "expired",
+        });
+        continue;
+      }
+
+      const senderDoc = await usersRef.doc(invitationData.senderUserId).get();
+      const senderData = senderDoc.exists ? senderDoc.data() : null;
+
+      invitations.push({
+        id: doc.id,
+        token: doc.id,
+        senderName: senderData?.name || invitationData.senderEmail,
+        senderEmail: invitationData.senderEmail,
+        createdAt: invitationData.createdAt?.toDate()?.toISOString(),
+        expiresAt: invitationData.expiresAt?.toDate()?.toISOString(),
+      });
+    }
+
+    // ⭐ 클라이언트에서 정렬
+    invitations.sort((a, b) => {
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+
+    res.status(200).json({
+      status: 200,
+      message: "초대장 목록 조회 성공",
+      data: {
+        invitations,
+        count: invitations.length,
+      },
+    });
+  } catch (error) {
+    console.error("초대장 목록 조회 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "초대장 목록 조회 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+      },
+    });
+  }
+});
+
+// 초대장 거절 API (인증 필요)
+router.post("/reject", authenticateToken, async (req, res) => {
+  try {
+    const { userId, email } = req.user;
+    const { token } = req.body;
+
+    // ============================================
+    // 1. 토큰 검증
+    // ============================================
+    if (!token) {
+      return res.status(400).json({
+        status: 400,
+        error: "초대 토큰이 필요합니다.",
+        data: {
+          missingToken: true,
+        },
+      });
+    }
+
+    // invitations 컬렉션에서 초대 정보 조회
+    const invitationsRef = db.collection("invitations");
+    const invitationDoc = await invitationsRef.doc(token).get();
+
+    if (!invitationDoc.exists) {
+      return res.status(400).json({
+        status: 400,
+        error: "유효하지 않은 초대장입니다.",
+        data: {
+          invalidToken: true,
+        },
+      });
+    }
+
+    const invitationData = invitationDoc.data();
+
+    // 수신자 확인
+    if (invitationData.receiverEmail !== email.toLowerCase().trim()) {
+      return res.status(403).json({
+        status: 403,
+        error: "본인이 받은 초대장만 거절할 수 있습니다.",
+      });
+    }
+
+    // 이미 처리된 초대장인지 확인
+    if (invitationData.status !== "pending") {
+      return res.status(400).json({
+        status: 400,
+        error: "이미 처리된 초대장입니다.",
+        data: {
+          status: invitationData.status,
+        },
+      });
+    }
+
+    // ============================================
+    // 2. 초대장 상태를 'rejected'로 변경
+    // ============================================
+    await invitationDoc.ref.update({
+      status: "rejected",
+      rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(
+      `✅ 초대장 거절: ${invitationData.senderEmail} -> ${invitationData.receiverEmail}`
+    );
+
+    res.status(200).json({
+      status: 200,
+      message: "초대장이 거절되었습니다.",
+      data: {
+        token,
+        rejectedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("초대장 거절 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "초대장 거절 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+      },
+    });
+  }
+});
+
 // 초대장 정보 조회 API (인증 불필요, 토큰으로 확인)
 router.get("/accept/info", async (req, res) => {
   try {
@@ -430,8 +621,9 @@ router.get("/accept/info", async (req, res) => {
 });
 
 // 초대장 수락 API (인증 불필요, 토큰으로 인증)
-router.post("/accept", async (req, res) => {
+router.post("/accept", authenticateToken, async (req, res) => {
   try {
+    const { userId, email } = req.user; // ⭐ 현재 로그인한 사용자 정보
     const { token } = req.body;
 
     // ============================================
@@ -462,6 +654,14 @@ router.post("/accept", async (req, res) => {
     }
 
     const invitationData = invitationDoc.data();
+
+    // ⭐ 현재 로그인한 사용자가 수신자인지 확인
+    if (invitationData.receiverEmail !== email.toLowerCase().trim()) {
+      return res.status(403).json({
+        status: 403,
+        error: "본인이 받은 초대장만 수락할 수 있습니다.",
+      });
+    }
 
     // 이미 처리된 초대장인지 확인
     if (invitationData.status !== "pending") {
@@ -535,8 +735,8 @@ router.post("/accept", async (req, res) => {
     batch.update(usersRef.doc(invitationData.senderUserId), {
       coupleId,
       partnerEmail: invitationData.receiverEmail,
-      partnerName: receiverData.name || null, // 파트너 이름 추가
-      partnerNickname: receiverData.nickname || null, // 파트너 닉네임 추가
+      partnerName: receiverData.name || null,
+      partnerNickname: receiverData.nickname || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -544,8 +744,8 @@ router.post("/accept", async (req, res) => {
     batch.update(usersRef.doc(invitationData.receiverUserId), {
       coupleId,
       partnerEmail: invitationData.senderEmail,
-      partnerName: senderData.name || null, // 파트너 이름 추가
-      partnerNickname: senderData.nickname || null, // 파트너 닉네임 추가
+      partnerName: senderData.name || null,
+      partnerNickname: senderData.nickname || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -562,12 +762,20 @@ router.post("/accept", async (req, res) => {
     );
 
     // ============================================
-    // 3. 성공 응답 (200)
+    // 3. 성공 응답 (업데이트된 사용자 정보 포함)
     // ============================================
+    // 업데이트된 수신자 정보 조회
+    const updatedReceiverDoc = await usersRef
+      .doc(invitationData.receiverUserId)
+      .get();
+    const updatedReceiverData = updatedReceiverDoc.data();
+    const { password, ...receiverWithoutPassword } = updatedReceiverData;
+
     res.status(200).json({
       status: 200,
       message: "커플 연결이 완료되었습니다.",
       data: {
+        user: receiverWithoutPassword, // ⭐ 업데이트된 사용자 정보 반환
         partnerEmail: invitationData.senderEmail,
         partnerName: senderData.name || invitationData.senderEmail,
         partnerNickname: senderData.nickname || null,
