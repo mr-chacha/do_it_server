@@ -85,6 +85,15 @@ router.post("/events", authenticateToken, async (req, res) => {
       });
     }
 
+    // ⭐ 디버깅: 어떤 값이 저장되는지 확인
+    console.log("=== 일정 등록 디버깅 ===");
+    console.log("요청한 author:", author);
+    console.log("현재 userId:", userId);
+    console.log("coupleId:", userData.coupleId);
+    console.log("계산된 authorId:", authorId);
+    console.log("저장될 authorType:", author);
+    console.log("====================");
+
     // 일정 데이터 생성
     const eventData = {
       title: title.trim(),
@@ -381,36 +390,29 @@ router.get("/events", authenticateToken, async (req, res) => {
     snapshot.forEach((doc) => {
       const data = doc.data();
 
-      // ⭐ authorType을 우선적으로 사용 (저장된 원본 타입)
+      // ⭐ author 필드(실제 userId/coupleId)를 기준으로 판단
       let displayAuthor = "me"; // 기본값
 
-      if (data.authorType) {
-        // authorType이 있으면 그것을 사용 (가장 정확)
-        displayAuthor = data.authorType;
-      } else {
-        // authorType이 없으면 기존 로직 사용 (하위 호환성)
-        // author가 coupleId인 경우 (우리)
-        if (String(data.author) === String(userData.coupleId)) {
-          displayAuthor = "us";
-        }
-        // createdBy가 현재 사용자인 경우 (나)
-        else if (String(data.createdBy) === String(userId)) {
-          displayAuthor = "me";
-        }
-        // createdBy가 상대방인 경우 (상대방)
-        else if (
-          partnerUserId &&
-          String(data.createdBy) === String(partnerUserId)
-        ) {
-          displayAuthor = "partner";
-        }
-        // author가 상대방 userId인 경우도 체크 (이전 데이터 호환성)
-        else if (
-          partnerUserId &&
-          String(data.author) === String(partnerUserId)
-        ) {
-          displayAuthor = "partner";
-        }
+      // 1순위: author가 coupleId인 경우 (우리)
+      if (String(data.author) === String(userData.coupleId)) {
+        displayAuthor = "us";
+      }
+      // 2순위: author가 상대방 userId인 경우 (상대방 일정)
+      else if (partnerUserId && String(data.author) === String(partnerUserId)) {
+        displayAuthor = "partner";
+      }
+      // 3순위: author가 현재 userId인 경우 (나)
+      else if (String(data.author) === String(userId)) {
+        displayAuthor = "me";
+      }
+      // 4순위: createdBy 기준으로 판단 (이전 데이터 호환성)
+      else if (String(data.createdBy) === String(userId)) {
+        displayAuthor = "me";
+      } else if (
+        partnerUserId &&
+        String(data.createdBy) === String(partnerUserId)
+      ) {
+        displayAuthor = "partner";
       }
 
       const eventData = {
@@ -420,10 +422,10 @@ router.get("/events", authenticateToken, async (req, res) => {
         startDate: data.startDate.toDate(),
         endDate: data.endDate.toDate(),
         author: displayAuthor, // ⭐ 변환된 author
-        authorType: data.authorType || null, // 원본 authorType도 포함
+        authorType: data.authorType || null,
         repeatType: data.repeatType || "none",
         repeatEndDate: data.repeatEndDate ? data.repeatEndDate.toDate() : null,
-        exceptions: data.exceptions || [], // ⭐ 예외 일정 배열 추가
+        exceptions: data.exceptions || [],
         createdBy: data.createdBy,
         createdAt: data.createdAt?.toDate()?.toISOString(),
         updatedAt: data.updatedAt?.toDate()?.toISOString(),
@@ -572,17 +574,10 @@ router.put("/events/:eventId", authenticateToken, async (req, res) => {
 
     const eventData = eventDoc.data();
 
-    // 본인이 작성한 일정만 수정 가능
-    if (eventData.createdBy !== userId) {
-      return res.status(403).json({
-        status: 403,
-        error: "본인이 작성한 일정만 수정할 수 있습니다.",
-        data: {
-          eventId,
-          createdBy: eventData.createdBy,
-        },
-      });
-    }
+    // ✅ 커플은 모든 일정을 수정할 수 있음 (권한 체크 제거)
+    console.log(
+      `✅ 일정 수정 권한 확인: userId=${userId}, coupleId=${userData.coupleId}`
+    );
 
     // 작성자 ID 변환 (등록 API와 동일한 로직)
     let authorId = eventData.author; // 기본값: 기존 값 유지
@@ -858,21 +853,10 @@ router.delete("/events/:eventId", authenticateToken, async (req, res) => {
 
     const eventData = eventDoc.data();
 
-    // ⭐ "우리" 일정이면 둘 다 삭제 가능, 그 외에는 본인만 삭제 가능
-    const isUsEvent = eventData.author === userData.coupleId;
-    const isCreatedByMe = eventData.createdBy === userId;
-
-    if (!isUsEvent && !isCreatedByMe) {
-      // "우리"가 아니고 본인이 작성하지 않은 경우 삭제 불가
-      return res.status(403).json({
-        status: 403,
-        error: "본인이 작성한 일정만 삭제할 수 있습니다.",
-        data: {
-          eventId,
-          createdBy: eventData.createdBy,
-        },
-      });
-    }
+    // ✅ 커플은 모든 일정을 삭제할 수 있음 (권한 체크 제거)
+    console.log(
+      `✅ 일정 삭제 권한 확인: userId=${userId}, coupleId=${userData.coupleId}`
+    );
 
     // 삭제 타입에 따라 처리
     const isRecurring = eventData.repeatType && eventData.repeatType !== "none";

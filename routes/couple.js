@@ -725,8 +725,19 @@ router.post("/accept", authenticateToken, async (req, res) => {
       });
     }
 
-    // coupleId 생성 (발신자의 ID를 coupleId로 사용)
-    const coupleId = invitationData.senderUserId;
+    // ✅ 고유한 coupleId 생성
+    const couplesRef = db.collection("couples");
+    const newCoupleDoc = couplesRef.doc(); // Firebase가 자동으로 고유 ID 생성
+    const coupleId = newCoupleDoc.id;
+
+    // ✅ couples 컬렉션에 커플 정보 저장
+    await newCoupleDoc.set({
+      userIds: [invitationData.senderUserId, invitationData.receiverUserId],
+      senderUserId: invitationData.senderUserId,
+      receiverUserId: invitationData.receiverUserId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      connectedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
 
     // Firestore batch write로 두 사용자 동시 업데이트
     const batch = db.batch();
@@ -758,7 +769,7 @@ router.post("/accept", authenticateToken, async (req, res) => {
     await batch.commit();
 
     console.log(
-      `✅ 커플 연결 완료: ${invitationData.senderEmail} <-> ${invitationData.receiverEmail}`
+      `✅ 커플 연결 완료: ${invitationData.senderEmail} <-> ${invitationData.receiverEmail} (coupleId: ${coupleId})`
     );
 
     // ============================================
