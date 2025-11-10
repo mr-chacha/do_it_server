@@ -4,10 +4,150 @@ const { db, admin, bucket } = require("../firebase/firebase");
 const { authenticateToken } = require("../middleware/auth");
 const { verifiedEmails } = require("../utils/email");
 
+const { OAuth2Client } = require("google-auth-library");
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
 const router = express.Router();
 
 const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
+
+// 소셜 회원가입/로그인 (통합)
+// ============================================
+router.post("/social", async (req, res) => {
+  try {
+    const { provider, accessToken, email, name, profileImage } = req.body;
+
+    // 입력값 검증
+    if (!provider || !email || !name) {
+      return res.status(400).json({
+        status: 400,
+        error: "필수 정보가 누락되었습니다.",
+        data: {
+          missingFields: [
+            !provider && "provider",
+            !email && "email",
+            !name && "name",
+          ].filter(Boolean),
+        },
+      });
+    }
+
+    // 지원하는 provider 확인
+    if (!["google", "kakao"].includes(provider)) {
+      return res.status(400).json({
+        status: 400,
+        error: "지원하지 않는 소셜 로그인 방식입니다.",
+      });
+    }
+
+    const usersRef = db.collection("users");
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // ============================================
+    // 1. 기존 사용자 확인
+    // ============================================
+    const userSnapshot = await usersRef
+      .where("email", "==", normalizedEmail)
+      .limit(1)
+      .get();
+
+    let userData;
+    let userId;
+    let isNewUser = false;
+
+    if (userSnapshot.empty) {
+      // ============================================
+      // 2. 신규 사용자 → 자동 회원가입
+      // ============================================
+      isNewUser = true;
+      userId = usersRef.doc().id;
+
+      userData = {
+        id: userId,
+        name: name.trim(),
+        email: normalizedEmail,
+        provider: provider, // "google" or "kakao"
+        profileImage: profileImage || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        verified: true, // 소셜 로그인은 이메일 인증 완료로 간주
+        coupleId: null,
+        partnerEmail: null,
+      };
+
+      await usersRef.doc(userId).set(userData);
+
+      console.log(`✅ 소셜 회원가입 성공: ${email} (${provider})`);
+    } else {
+      // ============================================
+      // 3. 기존 사용자 → 로그인
+      // ============================================
+      const userDoc = userSnapshot.docs[0];
+      userId = userDoc.id;
+      userData = userDoc.data();
+
+      // 일반 회원가입 → 소셜 로그인 시도 시 provider 추가
+      if (!userData.provider) {
+        await usersRef.doc(userId).update({
+          provider: provider,
+          profileImage: profileImage || userData.profileImage,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        userData.provider = provider;
+      }
+
+      console.log(`✅ 소셜 로그인 성공: ${email} (${provider})`);
+    }
+
+    // ============================================
+    // 4. JWT 토큰 발급
+    // ============================================
+    const token = jwt.sign(
+      {
+        userId: userId,
+        email: userData.email,
+        name: userData.name,
+      },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    // ============================================
+    // 5. 성공 응답
+    // ============================================
+    res.status(200).json({
+      status: 200,
+      message: isNewUser ? "회원가입이 완료되었습니다." : "로그인 성공",
+      data: {
+        user: {
+          id: userData.id,
+          name: userData.name,
+          email: userData.email,
+          coupleId: userData.coupleId,
+          partnerEmail: userData.partnerEmail,
+          provider: userData.provider,
+          profileImage: userData.profileImage,
+          nickname: userData.nickname || null,
+        },
+        token: token,
+        isNewUser: isNewUser, // ⭐ 신규 회원인지 여부
+      },
+    });
+  } catch (error) {
+    console.error("소셜 인증 실패:", error);
+    res.status(500).json({
+      status: 500,
+      error: "소셜 인증 중 오류가 발생했습니다.",
+      data: {
+        timestamp: new Date().toISOString(),
+        code: error.code || "UNKNOWN_ERROR",
+        details:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
+      },
+    });
+  }
+});
 
 // 회원가입 API
 router.post("/signup", async (req, res) => {
